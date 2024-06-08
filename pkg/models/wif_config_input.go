@@ -9,7 +9,13 @@
  */
 package models
 
+import "encoding/json"
+
 type WifConfigInput struct {
 	DisplayName string `json:"display_name"`
 	ProjectId   string `json:"project_id"`
+}
+
+func (w *WifConfigInput) ToJson() ([]byte, error) {
+	return json.Marshal(w)
 }

@@ -9,8 +9,16 @@
  */
 package models
 
+import "encoding/json"
+
 type WifConfigOutput struct {
 	Metadata *WifConfigMetadata `json:"metadata,omitempty"`
 	Spec     *WifConfigInput    `json:"spec,omitempty"`
 	Status   *WifConfigStatus   `json:"status,omitempty"`
+}
+
+func WifConfigOutputFromJson(rawWifConfigOutput []byte) (WifConfigOutput, error) {
+	var output WifConfigOutput
+	err := json.Unmarshal(rawWifConfigOutput, &output)
+	return output, err
 }
