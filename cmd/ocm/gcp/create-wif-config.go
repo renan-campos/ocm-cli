@@ -30,15 +30,21 @@ var (
 		TargetDir: "",
 	}
 
+	// This could come from the backend. I think I asked about this already...
+	// I will ensure this is the case...
+	// It does indeed. We'll need to use the sdk to get this data, I wonder if we can use the local one for now.
 	impersonatorServiceAccount = "projects/sda-ccs-3/serviceAccounts/osd-impersonator@sda-ccs-3.iam.gserviceaccount.com"
 )
 
 const (
-	poolDescription = "Created by prototype CLI"
+	// I believe this would actually be better from this.
+	poolDescription = "Created by the OCM CLI"
 
+	// This also comes from the backend.
 	openShiftAudience = "openshift"
 )
 
+// TODO: Check dry-run, I'm not sure it is working at the moment.
 // NewCreateWorkloadIdentityConfiguration provides the "create-wif-config" subcommand
 func NewCreateWorkloadIdentityConfiguration() *cobra.Command {
 	createWorkloadIdentityPoolCmd := &cobra.Command{
@@ -48,7 +54,8 @@ func NewCreateWorkloadIdentityConfiguration() *cobra.Command {
 		PersistentPreRun: validationForCreateWorkloadIdentityConfigurationCmd,
 	}
 
-	createWorkloadIdentityPoolCmd.PersistentFlags().StringVar(&CreateWorkloadIdentityConfigurationOpts.Name, "name", "", "User-defined name for all created Google cloud resources (can be separate from the cluster's infra-id)")
+	createWorkloadIdentityPoolCmd.PersistentFlags().StringVar(
+		&CreateWorkloadIdentityConfigurationOpts.Name, "name", "", "User-defined name for all created Google cloud resources")
 	createWorkloadIdentityPoolCmd.MarkPersistentFlagRequired("name")
 	createWorkloadIdentityPoolCmd.PersistentFlags().StringVar(&CreateWorkloadIdentityConfigurationOpts.Project, "project", "", "ID of the Google cloud project")
 	createWorkloadIdentityPoolCmd.MarkPersistentFlagRequired("project")
@@ -82,6 +89,8 @@ func createWorkloadIdentityConfigurationCmd(cmd *cobra.Command, argv []string) {
 		IssuerUrl:              wifConfig.Status.WorkloadIdentityPoolData.IssuerUrl,
 		PoolIdentityProviderId: wifConfig.Status.WorkloadIdentityPoolData.IdentityProviderId,
 	}
+	// Given the number of parameters, these helper functions may benefit from a "parameters" struct.
+	// WDYT?
 	if err = createWorkloadIdentityPool(ctx, gcpClient, poolSpec, CreateWorkloadIdentityConfigurationOpts.DryRun); err != nil {
 		log.Fatalf("Failed to create workload identity pool: %s", err)
 	}
@@ -93,15 +102,16 @@ func createWorkloadIdentityConfigurationCmd(cmd *cobra.Command, argv []string) {
 	if err = createServiceAccounts(ctx, gcpClient, wifConfig, CreateWorkloadIdentityConfigurationOpts.DryRun); err != nil {
 		log.Fatalf("Failed to create IAM service accounts: %s", err)
 	}
-
 }
 
 func validationForCreateWorkloadIdentityConfigurationCmd(cmd *cobra.Command, argv []string) {
 	if CreateWorkloadIdentityConfigurationOpts.Name == "" {
-		panic("Name is required")
+		// I don't think we should panic. Showing the user the backtrace is not
+		// a good experience for users that are not developers.
+		log.Fatal("Name is required")
 	}
 	if CreateWorkloadIdentityConfigurationOpts.Project == "" {
-		panic("Project is required")
+		log.Fatal("Project is required")
 	}
 
 	if CreateWorkloadIdentityConfigurationOpts.TargetDir == "" {
@@ -125,11 +135,11 @@ func validationForCreateWorkloadIdentityConfigurationCmd(cmd *cobra.Command, arg
 	if !sResult.IsDir() {
 		log.Fatalf("file %s exists and is not a directory", fPath)
 	}
-
 }
 
 func createWorkloadIdentityConfiguration(input models.WifConfigInput) (*models.WifConfigOutput, error) {
 	// TODO: Implement the actual creation of the workload identity configuration
+	// This would be the backend call, and will request an OCM client.
 	return mockWifConfig(), nil
 }
 
@@ -138,81 +148,89 @@ func createWorkloadIdentityPool(ctx context.Context, client gcp.GcpClient, spec 
 	project := spec.ProjectId
 	if generateOnly {
 		log.Printf("Would have created workload identity pool %s", name)
-	} else {
-		parentResourceForPool := fmt.Sprintf("projects/%s/locations/global", project)
-		poolResource := fmt.Sprintf("%s/workloadIdentityPools/%s", parentResourceForPool, name)
-		resp, err := client.GetWorkloadIdentityPool(ctx, poolResource)
-		if resp != nil && resp.State == "DELETED" {
-			log.Printf("Workload identity pool %s was deleted", name)
-			_, err := client.UndeleteWorkloadIdentityPool(ctx, poolResource, &iamv1.UndeleteWorkloadIdentityPoolRequest{})
-			if err != nil {
-				return errors.Wrapf(err, "failed to undelete workload identity pool %s", name)
-			}
-		} else if err != nil {
-			if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 && strings.Contains(gerr.Message, "Requested entity was not found") {
-				pool := &iamv1.WorkloadIdentityPool{
-					Name:        name,
-					DisplayName: name,
-					Description: poolDescription,
-					State:       "ACTIVE",
-					Disabled:    false,
-				}
-
-				_, err := client.CreateWorkloadIdentityPool(ctx, parentResourceForPool, name, pool)
-				if err != nil {
-					return errors.Wrapf(err, "failed to create workload identity pool %s", name)
-				}
-				log.Printf("Workload identity pool created with name %s", name)
-			} else {
-				return errors.Wrapf(err, "failed to check if there is existing workload identity pool %s", name)
-			}
-		} else {
-			log.Printf("Workload identity pool %s already exists", name)
-		}
+		// TODO gcloud command here. Can you create a tech-debt ticket for it?
+		return nil
 	}
+	parentResourceForPool := fmt.Sprintf("projects/%s/locations/global", project)
+	poolResource := fmt.Sprintf("%s/workloadIdentityPools/%s", parentResourceForPool, name)
+	resp, err := client.GetWorkloadIdentityPool(ctx, poolResource)
+	// Ok this is kinda wild syntax but I think it looks cleaner this way. I
+	// want to get your thoughts on it: I think this has the advantage of less
+	// nested if statements, and we are expressing that the execution flow is
+	// parameterized.
+	// Let me know what you think:
+	switch {
+	case err != nil:
+		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 && strings.Contains(gerr.Message, "Requested entity was not found") {
+			pool := &iamv1.WorkloadIdentityPool{
+				Name:        name,
+				DisplayName: name,
+				Description: poolDescription,
+				State:       "ACTIVE",
+				Disabled:    false,
+			}
 
-	return nil
+			_, err := client.CreateWorkloadIdentityPool(ctx, parentResourceForPool, name, pool)
+			if err != nil {
+				return errors.Wrapf(err, "failed to create workload identity pool %s", name)
+			}
+			log.Printf("Workload identity pool created with name %s", name)
+		} else {
+			return errors.Wrapf(err, "failed to check if there is existing workload identity pool %s", name)
+		}
+		return nil
+	case resp != nil && resp.State == "DELETED":
+		log.Printf("Workload identity pool %s was deleted", name)
+		_, err := client.UndeleteWorkloadIdentityPool(ctx, poolResource, &iamv1.UndeleteWorkloadIdentityPoolRequest{})
+		if err != nil {
+			return errors.Wrapf(err, "failed to undelete workload identity pool %s", name)
+		}
+		return nil
+	default:
+		log.Printf("Workload identity pool %s already exists", name)
+		return nil
+	}
 }
 
 func createWorkloadIdentityProvider(ctx context.Context, client gcp.GcpClient, spec gcp.WorkloadIdentityPoolSpec, generateOnly bool) error {
 	if generateOnly {
 		log.Printf("Would have created workload identity provider for %s with issuerURL %s", spec.PoolName, spec.IssuerUrl)
-	} else {
-		providerResource := fmt.Sprintf("projects/%s/locations/global/workloadIdentityPools/%s/providers/%s", spec.ProjectId, spec.PoolName, spec.PoolName)
-		_, err := client.GetWorkloadIdentityProvider(ctx, providerResource)
-		if err != nil {
-			if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 && strings.Contains(gerr.Message, "Requested entity was not found") {
-				provider := &iam.WorkloadIdentityPoolProvider{
-					Name:        spec.PoolName,
-					DisplayName: spec.PoolName,
-					Description: poolDescription,
-					State:       "ACTIVE",
-					Disabled:    false,
-					Oidc: &iam.Oidc{
-						AllowedAudiences: []string{openShiftAudience},
-						IssuerUri:        spec.IssuerUrl,
-						JwksJson:         spec.Jwks,
-					},
-					AttributeMapping: map[string]string{
-						// when token exchange happens, sub from oidc token shared by operator pod will be mapped to google.subject
-						// field of google auth token. The field is used to allow fine-grained access to gcp service accounts.
-						// The format is `system:serviceaccount:<service_account_namespace>:<service_account_name>`
-						"google.subject": "assertion.sub",
-					},
-				}
-
-				_, err := client.CreateWorkloadIdentityProvider(ctx, fmt.Sprintf("projects/%s/locations/global/workloadIdentityPools/%s", spec.ProjectId, spec.PoolName), spec.PoolName, provider)
-				if err != nil {
-					return errors.Wrapf(err, "failed to create workload identity provider %s", spec.PoolName)
-				}
-				log.Printf("workload identity provider created with name %s", spec.PoolName)
-			} else {
-				return errors.Wrapf(err, "failed to check if there is existing workload identity provider %s in pool %s", spec.PoolName, spec.PoolName)
+		return nil
+	}
+	providerResource := fmt.Sprintf("projects/%s/locations/global/workloadIdentityPools/%s/providers/%s", spec.ProjectId, spec.PoolName, spec.PoolName)
+	_, err := client.GetWorkloadIdentityProvider(ctx, providerResource)
+	if err != nil {
+		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 && strings.Contains(gerr.Message, "Requested entity was not found") {
+			provider := &iam.WorkloadIdentityPoolProvider{
+				Name:        spec.PoolName,
+				DisplayName: spec.PoolName,
+				Description: poolDescription,
+				State:       "ACTIVE",
+				Disabled:    false,
+				Oidc: &iam.Oidc{
+					AllowedAudiences: []string{openShiftAudience},
+					IssuerUri:        spec.IssuerUrl,
+					JwksJson:         spec.Jwks,
+				},
+				AttributeMapping: map[string]string{
+					// TODO: This will come from the spec
+					// when token exchange happens, sub from oidc token shared by operator pod will be mapped to google.subject
+					// field of google auth token. The field is used to allow fine-grained access to gcp service accounts.
+					// The format is `system:serviceaccount:<service_account_namespace>:<service_account_name>`
+					"google.subject": "assertion.sub",
+				},
 			}
-		} else {
-			log.Printf("Workload identity provider %s already exists in pool %s", spec.PoolName, spec.PoolName)
-		}
 
+			_, err := client.CreateWorkloadIdentityProvider(ctx, fmt.Sprintf("projects/%s/locations/global/workloadIdentityPools/%s", spec.ProjectId, spec.PoolName), spec.PoolName, provider)
+			if err != nil {
+				return errors.Wrapf(err, "failed to create workload identity provider %s", spec.PoolName)
+			}
+			log.Printf("workload identity provider created with name %s", spec.PoolName)
+		} else {
+			return errors.Wrapf(err, "failed to check if there is existing workload identity provider %s in pool %s", spec.PoolName, spec.PoolName)
+		}
+	} else {
+		log.Printf("Workload identity provider %s already exists in pool %s", spec.PoolName, spec.PoolName)
 	}
 	return nil
 }
@@ -245,6 +263,7 @@ func createServiceAccounts(ctx context.Context, gcpClient gcp.GcpClient, wifOutp
 		serviceAccountName := wifOutput.Spec.DisplayName + "-" + serviceAccountID
 		serviceAccountDesc := poolDescription + " for WIF config " + wifOutput.Spec.DisplayName
 
+		// TODO output cleanup
 		fmt.Println("Creating service account", serviceAccountID)
 		_, err := CreateServiceAccount(gcpClient, serviceAccountID, serviceAccountName, serviceAccountDesc, projectId, true)
 		if err != nil {
@@ -285,7 +304,6 @@ func createServiceAccounts(ctx context.Context, gcpClient gcp.GcpClient, wifOutp
 		}
 		fmt.Printf("\t\tAccess granted to %s\n", serviceAccount.Id)
 	}
-
 	return nil
 }
 
@@ -310,14 +328,7 @@ func CreateServiceAccount(gcpClient gcp.GcpClient, svcAcctID, svcAcctName, svcAc
 	return svcAcct, err
 }
 
-func generateServiceAccountID(serviceAccount models.ServiceAccount) string {
-	serviceAccountID := "z-" + serviceAccount.Id
-	if len(serviceAccountID) > 30 {
-		serviceAccountID = serviceAccountID[:30]
-	}
-	return serviceAccountID
-}
-
+// TODO: Create wif config through OCM backend
 func mockWifConfig() *models.WifConfigOutput {
 	return &models.WifConfigOutput{
 		Metadata: &models.WifConfigMetadata{
