@@ -11,8 +11,8 @@ import (
 	"github.com/googleapis/gax-go/v2/apierror"
 
 	"cloud.google.com/go/iam/admin/apiv1/adminpb"
-	"github.com/openshift-online/ocm-cli/cmd/ocm/gcp/models"
 	"github.com/openshift-online/ocm-cli/pkg/gcp"
+	"github.com/openshift-online/ocm-cli/pkg/models"
 	"github.com/pkg/errors"
 
 	"github.com/spf13/cobra"
