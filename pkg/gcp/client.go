@@ -3,6 +3,7 @@ package gcp
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"cloud.google.com/go/iam"
 	iamadmin "cloud.google.com/go/iam/admin/apiv1"
@@ -19,20 +20,28 @@ import (
 type GcpClient interface {
 	AttachImpersonator(ctx context.Context, saId, projectId, impersonatorResourceId string) error
 	AttachWorkloadIdentityPool(ctx context.Context, sa *cmv1.WifServiceAccount, poolId, projectId string) error
+	AddRoleToServiceAccount(ctx context.Context, serviceAccountId string, roleId string, projectId string) error
 	CreateRole(context.Context, *adminpb.CreateRoleRequest) (*adminpb.Role, error)
 	CreateServiceAccount(ctx context.Context, request *adminpb.CreateServiceAccountRequest) (*adminpb.ServiceAccount, error)                               //nolint:lll
 	CreateWorkloadIdentityPool(ctx context.Context, parent, poolID string, pool *iamv1.WorkloadIdentityPool) (*iamv1.Operation, error)                     //nolint:lll
 	CreateWorkloadIdentityProvider(ctx context.Context, parent, providerID string, provider *iamv1.WorkloadIdentityPoolProvider) (*iamv1.Operation, error) //nolint:lll
 	DeleteServiceAccount(ctx context.Context, saName string, project string, allowMissing bool) error
-	DeleteWorkloadIdentityPool(ctx context.Context, resource string) (*iamv1.Operation, error)                                                            //nolint:lll
+	DeleteWorkloadIdentityPool(ctx context.Context, resource string) (*iamv1.Operation, error) //nolint:lll
+	DetachImpersonator(ctx context.Context, saId, projectId, impersonatorResourceId string) error
+	DetachWorkloadIdentityPool(ctx context.Context, sa *cmv1.WifServiceAccount, poolId, projectId string) error
+	DisableServiceAccount(ctx context.Context, serviceAccountId string, projectId string) error
+	EnableServiceAccount(ctx context.Context, serviceAccountId string, projectId string) error
 	GetProjectIamPolicy(ctx context.Context, projectName string, request *cloudresourcemanager.GetIamPolicyRequest) (*cloudresourcemanager.Policy, error) //nolint:lll
 	GetRole(context.Context, *adminpb.GetRoleRequest) (*adminpb.Role, error)
 	GetServiceAccount(ctx context.Context, request *adminpb.GetServiceAccountRequest) (*adminpb.ServiceAccount, error)
+	GetServiceAccountv2(ctx context.Context, serviceAccountId string, projectId string) (ServiceAccount, error)
 	GetWorkloadIdentityPool(ctx context.Context, resource string) (*iamv1.WorkloadIdentityPool, error)             //nolint:lll
 	GetWorkloadIdentityProvider(ctx context.Context, resource string) (*iamv1.WorkloadIdentityPoolProvider, error) //nolint:lll
 	ProjectNumberFromId(ctx context.Context, projectId string) (int64, error)
+	RemoveRoleFromServiceAccount(ctx context.Context, serviceAccountId string, roleId string, projectId string) error
 	SetProjectIamPolicy(ctx context.Context, svcAcctResource string, request *cloudresourcemanager.SetIamPolicyRequest) (*cloudresourcemanager.Policy, error) //nolint:lll
 	UndeleteRole(context.Context, *adminpb.UndeleteRoleRequest) (*adminpb.Role, error)
+	UndeleteServiceAccount(ctx context.Context, serviceAccountId string, projectId string) error
 	UndeleteWorkloadIdentityPool(ctx context.Context, resource string, request *iamv1.UndeleteWorkloadIdentityPoolRequest) (*iamv1.Operation, error) //nolint:lll
 	UpdateRole(context.Context, *adminpb.UpdateRoleRequest) (*adminpb.Role, error)
 }
@@ -140,6 +149,38 @@ func (c *gcpClient) AttachWorkloadIdentityPool(
 	return nil
 }
 
+func (c *gcpClient) AddRoleToServiceAccount(
+	ctx context.Context,
+	serviceAccountId string,
+	roleId string,
+	projectId string,
+) error {
+	policy, err := c.GetProjectIamPolicy(ctx, projectId, &cloudresourcemanager.GetIamPolicyRequest{})
+	if err != nil {
+		return err
+	}
+	for _, binding := range policy.Bindings {
+		// The role name attached to the binding has a prefix based on whether it is a custom role.
+		// A custom role will include the project it is define in within its path.
+		// A predefined role will not.
+		// The roleId passed in does not include this path, so the method looks for the basename that matches.
+		roleParts := strings.Split(binding.Role, "/")
+		roleBasename := roleParts[len(roleParts)-1]
+		if roleBasename == roleId {
+			// Iam policy syntax lists service account members with a type prefix.
+			policyServiceAccountId := fmt.Sprintf(
+				"serviceAccount:%s@%s.iam.gserviceaccount.com",
+				serviceAccountId, projectId)
+			binding.Members = append(binding.Members, policyServiceAccountId)
+			_, err = c.SetProjectIamPolicy(ctx, projectId, &cloudresourcemanager.SetIamPolicyRequest{
+				Policy: policy,
+			})
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *gcpClient) CreateRole(ctx context.Context, request *adminpb.CreateRoleRequest) (*adminpb.Role, error) {
 	return c.iamClient.CreateRole(ctx, request)
 }
@@ -178,6 +219,101 @@ func (c *gcpClient) DeleteWorkloadIdentityPool(ctx context.Context, resource str
 	return c.oldIamClient.Projects.Locations.WorkloadIdentityPools.Delete(resource).Context(ctx).Do()
 }
 
+func (c *gcpClient) DetachImpersonator(
+	ctx context.Context,
+	saId string,
+	projectId string,
+	impersonatorEmail string,
+) error {
+	saResourceId := fmt.Sprintf("projects/%s/serviceAccounts/%s@%s.iam.gserviceaccount.com",
+		projectId, saId, projectId)
+	policy, err := c.iamClient.GetIamPolicy(ctx, &iampb.GetIamPolicyRequest{
+		Resource: saResourceId,
+	})
+	if err != nil {
+		return c.handleDetachImpersonatorError(err)
+	}
+	policy.Remove(
+		fmt.Sprintf("serviceAccount:%s", impersonatorEmail),
+		iam.RoleName("roles/iam.serviceAccountTokenCreator"))
+	_, err = c.iamClient.SetIamPolicy(ctx, &iamadmin.SetIamPolicyRequest{
+		Resource: saResourceId,
+		Policy:   policy,
+	})
+	if err != nil {
+		return c.handleDetachImpersonatorError(err)
+	}
+	return nil
+}
+
+func (c *gcpClient) DetachWorkloadIdentityPool(
+	ctx context.Context,
+	sa *cmv1.WifServiceAccount,
+	poolId string,
+	projectId string,
+) error {
+	saResourceId := c.fmtSaResourceId(sa.ServiceAccountId(), projectId)
+
+	projectNum, err := c.ProjectNumberFromId(ctx, projectId)
+	if err != nil {
+		return c.handleDetachWorkloadIdentityPoolError(err)
+	}
+
+	policy, err := c.iamClient.GetIamPolicy(ctx, &iampb.GetIamPolicyRequest{
+		Resource: saResourceId,
+	})
+	if err != nil {
+		return c.handleAttachWorkloadIdentityPoolError(err)
+	}
+	for _, openshiftServiceAccount := range sa.CredentialRequest().ServiceAccountNames() {
+		policy.Remove(
+			//nolint:lll
+			fmt.Sprintf(
+				"principal://iam.googleapis.com/projects/%d/locations/global/workloadIdentityPools/%s/subject/system:serviceaccount:%s:%s",
+				projectNum, poolId, sa.CredentialRequest().SecretRef().Namespace(), openshiftServiceAccount,
+			),
+			iam.RoleName("roles/iam.workloadIdentityUser"))
+	}
+	_, err = c.iamClient.SetIamPolicy(ctx, &iamadmin.SetIamPolicyRequest{
+		Resource: saResourceId,
+		Policy:   policy,
+	})
+	if err != nil {
+		return c.handleDetachWorkloadIdentityPoolError(err)
+	}
+	return nil
+}
+
+func (c *gcpClient) DisableServiceAccount(
+	ctx context.Context,
+	serviceAccountId string,
+	projectId string,
+) error {
+	_, err := c.oldIamClient.Projects.ServiceAccounts.Disable(
+		c.fmtSaResourceId(serviceAccountId, projectId),
+		&iamv1.DisableServiceAccountRequest{},
+	).Do()
+	if err != nil {
+		return c.handleDisableServiceAccountError(err)
+	}
+	return nil
+}
+
+func (c *gcpClient) EnableServiceAccount(
+	ctx context.Context,
+	serviceAccountId string,
+	projectId string,
+) error {
+	_, err := c.oldIamClient.Projects.ServiceAccounts.Enable(
+		c.fmtSaResourceId(serviceAccountId, projectId),
+		&iamv1.EnableServiceAccountRequest{},
+	).Do()
+	if err != nil {
+		return c.handleEnableServiceAccountError(err)
+	}
+	return nil
+}
+
 //nolint:lll
 func (c *gcpClient) GetProjectIamPolicy(
 	ctx context.Context,
@@ -198,6 +334,23 @@ func (c *gcpClient) GetServiceAccount(
 	return c.iamClient.GetServiceAccount(ctx, request)
 }
 
+func (c *gcpClient) GetServiceAccountv2(
+	ctx context.Context,
+	serviceAccountId string,
+	projectId string,
+) (ServiceAccount, error) {
+	sa, err := c.iamClient.GetServiceAccount(
+		ctx,
+		&adminpb.GetServiceAccountRequest{
+			Name: c.fmtSaResourceId(serviceAccountId, projectId),
+		},
+	)
+	if err != nil {
+		return nil, c.handleGetServiceAccountError(err)
+	}
+	return NewServiceAccount(sa)
+}
+
 //nolint:lll
 func (c *gcpClient) GetWorkloadIdentityPool(ctx context.Context, resource string) (*iamv1.WorkloadIdentityPool, error) {
 	return c.oldIamClient.Projects.Locations.WorkloadIdentityPools.Get(resource).Context(ctx).Do()
@@ -216,6 +369,45 @@ func (c *gcpClient) ProjectNumberFromId(ctx context.Context, projectId string) (
 	return project.ProjectNumber, nil
 }
 
+func (c *gcpClient) RemoveRoleFromServiceAccount(
+	ctx context.Context,
+	serviceAccountId string,
+	roleId string,
+	projectId string,
+) error {
+	policy, err := c.GetProjectIamPolicy(ctx, projectId, &cloudresourcemanager.GetIamPolicyRequest{})
+	if err != nil {
+		return err
+	}
+	for i, binding := range policy.Bindings {
+		// The role name attached to the binding has a prefix based on whether it is a custom role.
+		// A custom role will include the project it is define in within its path.
+		// A predefined role will not.
+		// The roleId passed in does not include this path, so the method looks for the basename that matches.
+		roleParts := strings.Split(binding.Role, "/")
+		roleBasename := roleParts[len(roleParts)-1]
+		if roleBasename == roleId {
+			newMembers := []string{}
+			for _, member := range binding.Members {
+				// Iam policy syntax lists service account members with a type prefix.
+				policyServiceAccountId := fmt.Sprintf(
+					"serviceAccount:%s@%s.iam.gserviceaccount.com",
+					serviceAccountId, projectId)
+
+				if member != policyServiceAccountId {
+					newMembers = append(newMembers, member)
+				}
+			}
+			policy.Bindings[i].Members = newMembers
+			_, err = c.SetProjectIamPolicy(ctx, projectId, &cloudresourcemanager.SetIamPolicyRequest{
+				Policy: policy,
+			})
+			return err
+		}
+	}
+	return nil
+}
+
 //nolint:lll
 func (c *gcpClient) SetProjectIamPolicy(ctx context.Context, svcAcctResource string, request *cloudresourcemanager.SetIamPolicyRequest) (*cloudresourcemanager.Policy, error) {
 	return c.cloudResourceManager.Projects.SetIamPolicy(svcAcctResource, request).Context(ctx).Do()
@@ -223,6 +415,23 @@ func (c *gcpClient) SetProjectIamPolicy(ctx context.Context, svcAcctResource str
 
 func (c *gcpClient) UndeleteRole(ctx context.Context, request *adminpb.UndeleteRoleRequest) (*adminpb.Role, error) {
 	return c.iamClient.UndeleteRole(ctx, request)
+}
+
+// Note: The serviceAccountId value must be the service account's unique ID,
+// not the email, for undelete to work.
+func (c *gcpClient) UndeleteServiceAccount(
+	ctx context.Context,
+	serviceAccountId string,
+	projectId string,
+) error {
+	_, err := c.oldIamClient.Projects.ServiceAccounts.Undelete(
+		fmt.Sprintf("projects/%s/serviceAccounts/%s", projectId, serviceAccountId),
+		&iamv1.UndeleteServiceAccountRequest{},
+	).Do()
+	if err != nil {
+		return c.handleUndeleteServiceAccountError(err)
+	}
+	return nil
 }
 
 //nolint:lll
